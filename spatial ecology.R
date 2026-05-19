@@ -361,4 +361,3 @@ main <- function() {
   write.csv(species_pa_full, out_path("hmsc_presence_absence_matrix.csv"), row.names = TRUE)
   write.csv(prevalence_table_full, out_path("hmsc_species_prevalence_table.csv"), row.names = FALSE)
   write.csv(excluded_species_table, out_path("hmsc_excluded_species_table.csv"), row.names = FALSE)
-}
