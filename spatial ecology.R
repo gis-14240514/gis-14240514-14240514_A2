@@ -590,7 +590,7 @@ main <- function() {
 
   make_heatmap(
     beta_heatmap,
-    "fig_01_hmsc_beta_heatmap.png",
+    "hmsc_beta_heatmap.png",
     "Hmsc posterior mean environmental effects",
     value_labels = TRUE,
     legend_title = "Posterior mean"
@@ -617,7 +617,7 @@ main <- function() {
 
   write.csv(predictor_summary, out_path("hmsc_predictor_response_summary.csv"), row.names = FALSE)
 
-  png(out_path("fig_03_hmsc_predictor_response_counts.png"), width = 1500, height = 1000, res = 160)
+  png(out_path("hmsc_predictor_response_counts.png"), width = 1500, height = 1000, res = 160)
   old_par <- par(no.readonly = TRUE)
   par(mar = c(7, 5, 4, 2))
 
@@ -868,7 +868,7 @@ main <- function() {
   write.csv(cv_summary, out_path("hmsc_cv_summary.csv"), row.names = FALSE)
 
   # Figure 4: observed prevalence against cross-validated predicted prevalence.
-  png(out_path("fig_04_hmsc_cv_observed_vs_predicted_prevalence.png"), width = 1300, height = 1100, res = 160)
+  png(out_path("hmsc_cv_observed_vs_predicted_prevalence.png"), width = 1300, height = 1100, res = 160)
   old_par <- par(no.readonly = TRUE)
   par(mar = c(5, 5, 4, 2))
 
@@ -935,7 +935,7 @@ main <- function() {
   dev.off()
 
   # Figure 5: in-sample AUC against cross-validated AUC.
-  png(out_path("fig_05_hmsc_insample_vs_cv_auc.png"), width = 1400, height = 1100, res = 160)
+  png(out_path("hmsc_insample_vs_cv_auc.png"), width = 1400, height = 1100, res = 160)
   old_par <- par(no.readonly = TRUE)
   par(mar = c(5, 5, 4, 2))
 
@@ -988,7 +988,7 @@ main <- function() {
 
   make_heatmap(
     association_matrix,
-    "fig_06_hmsc_species_association_heatmap.png",
+    "hmsc_species_association_heatmap.png",
     "Hmsc residual species association matrix",
     zlim = c(-1, 1),
     value_labels = FALSE,
