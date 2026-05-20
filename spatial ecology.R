@@ -646,3 +646,485 @@ main <- function() {
 
   par(old_par)
   dev.off()
+# 8. Calculate fitted probabilities and five-fold cross-validation
+
+  # First calculate fitted probabilities from the final selected model.
+  # These are used for the in-sample AUC comparison.
+  pred_array <- try(computePredictedValues(selected_model), silent = TRUE)
+
+  if (!inherits(pred_array, "try-error") && length(dim(pred_array)) == 3) {
+    pred_probs <- apply(pred_array, c(1, 2), mean, na.rm = TRUE)
+    prediction_method <- "computePredictedValues averaged across posterior samples"
+  } else {
+    X_matrix <- model.matrix(x_formula, data = XData)
+    beta_for_prediction <- beta_mean[match(colnames(X_matrix), rownames(beta_mean)), , drop = FALSE]
+    pred_probs <- pnorm(X_matrix %*% beta_for_prediction)
+    prediction_method <- "posterior mean fixed effects with probit inverse link"
+  }
+
+  pred_probs <- as.matrix(pred_probs)
+  colnames(pred_probs) <- species_names
+  rownames(pred_probs) <- as.character(site_ids_model)
+
+  write.csv(
+    data.frame(Sites = site_ids_model, pred_probs, check.names = FALSE),
+    out_path("hmsc_predicted_probabilities.csv"),
+    row.names = FALSE
+  )
+
+  observed_prev <- colMeans(Y, na.rm = TRUE)
+  predicted_prev <- colMeans(pred_probs, na.rm = TRUE)
+
+  predictive_performance <- data.frame(
+    species = species_names,
+    observed_prevalence = observed_prev[species_names],
+    predicted_prevalence = predicted_prev[species_names],
+    auc = NA_real_,
+    rmse = NA_real_,
+    tjur_r2 = NA_real_,
+    prediction_method = prediction_method,
+    stringsAsFactors = FALSE
+  )
+
+  for (sp in species_names) {
+    obs <- Y[, sp]
+    score <- pred_probs[, sp]
+
+    predictive_performance$auc[predictive_performance$species == sp] <- simple_auc(obs, score)
+    predictive_performance$rmse[predictive_performance$species == sp] <-
+      sqrt(mean((obs - score)^2, na.rm = TRUE))
+    predictive_performance$tjur_r2[predictive_performance$species == sp] <-
+      mean(score[obs == 1], na.rm = TRUE) - mean(score[obs == 0], na.rm = TRUE)
+  }
+
+  write.csv(predictive_performance, out_path("hmsc_species_predictive_performance.csv"), row.names = FALSE)
+
+  # Five-fold cross-validation.
+  # The folds are fixed by the seed so the validation split can be reproduced.
+  set.seed(123)
+  n_folds <- 5
+  fold_id <- sample(rep(seq_len(n_folds), length.out = nrow(Y)))
+
+  cv_partition <- data.frame(
+    Sites = site_ids_model,
+    fold = fold_id,
+    stringsAsFactors = FALSE
+  )
+  write.csv(cv_partition, out_path("hmsc_cv_partition.csv"), row.names = FALSE)
+
+  cv_pred_probs <- matrix(
+    NA_real_,
+    nrow = nrow(Y),
+    ncol = ncol(Y),
+    dimnames = list(as.character(site_ids_model), species_names)
+  )
+
+  cv_model_rows <- list()
+
+  for (fold in seq_len(n_folds)) {
+    train_rows <- fold_id != fold
+    test_rows <- fold_id == fold
+
+    Y_train <- Y[train_rows, , drop = FALSE]
+    X_train <- XData[train_rows, , drop = FALSE]
+    X_test <- XData[test_rows, , drop = FALSE]
+
+    # Use the same model structure as the final model where possible.
+    cv_studyDesign <- data.frame(site = factor(seq_len(nrow(Y_train))))
+    cv_ranLevels <- list(site = HmscRandomLevel(units = cv_studyDesign$site))
+
+    cv_model <- Hmsc(
+      Y = Y_train,
+      XData = X_train,
+      XFormula = x_formula,
+      distr = "probit",
+      studyDesign = cv_studyDesign,
+      ranLevels = cv_ranLevels
+    )
+
+    cv_fit <- fit_hmsc_with_settings(
+      cv_model,
+      paste("CV fold", fold, "site-level random effect"),
+      mcmc_settings
+    )
+
+    # If the random-effect model fails in a fold, use the fixed-effect structure.
+    if (!cv_fit$success) {
+      cv_model_fixed <- Hmsc(
+        Y = Y_train,
+        XData = X_train,
+        XFormula = x_formula,
+        distr = "probit"
+      )
+
+      cv_fit <- fit_hmsc_with_settings(
+        cv_model_fixed,
+        paste("CV fold", fold, "fixed effects only"),
+        mcmc_settings
+      )
+    }
+
+    if (!cv_fit$success) {
+      stop("Cross-validation failed in fold ", fold, ". Error: ", cv_fit$error)
+    }
+
+    cv_beta_samples <- extract_beta_samples(cv_fit$model)
+    cv_beta_mean <- apply(cv_beta_samples, c(1, 2), mean, na.rm = TRUE)
+
+    cv_cov_names <- cv_fit$model$covNames
+    if (is.null(cv_cov_names) || length(cv_cov_names) != dim(cv_beta_mean)[1]) {
+      cv_cov_names <- colnames(model.matrix(x_formula, data = X_train))
+    }
+
+    cv_species_names <- cv_fit$model$spNames
+    if (is.null(cv_species_names) || length(cv_species_names) != dim(cv_beta_mean)[2]) {
+      cv_species_names <- colnames(Y_train)
+    }
+
+    dimnames(cv_beta_mean) <- list(cv_cov_names, cv_species_names)
+
+    X_test_matrix <- model.matrix(x_formula, data = X_test)
+    beta_for_cv_prediction <- cv_beta_mean[match(colnames(X_test_matrix), rownames(cv_beta_mean)), , drop = FALSE]
+
+    if (any(is.na(match(colnames(X_test_matrix), rownames(cv_beta_mean))))) {
+      stop("Coefficient names did not match the test design matrix in CV fold ", fold)
+    }
+
+    fold_pred <- pnorm(X_test_matrix %*% beta_for_cv_prediction)
+    fold_pred <- as.matrix(fold_pred)
+    colnames(fold_pred) <- cv_species_names
+
+    cv_pred_probs[test_rows, cv_species_names] <- fold_pred
+
+    cv_model_rows[[fold]] <- data.frame(
+      fold = fold,
+      model_label = cv_fit$label,
+      success = cv_fit$success,
+      elapsed_minutes = cv_fit$elapsed_minutes,
+      samples = cv_fit$settings$samples,
+      transient = cv_fit$settings$transient,
+      thin = cv_fit$settings$thin,
+      nChains = cv_fit$settings$nChains,
+      warnings = paste(cv_fit$warnings, collapse = " | "),
+      error = cv_fit$error,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  cv_model_run <- do.call(rbind, cv_model_rows)
+  write.csv(cv_model_run, out_path("hmsc_cv_model_run.csv"), row.names = FALSE)
+
+  write.csv(
+    data.frame(Sites = site_ids_model, cv_pred_probs, check.names = FALSE),
+    out_path("hmsc_cv_predicted_probabilities.csv"),
+    row.names = FALSE
+  )
+
+  cv_predicted_prev <- colMeans(cv_pred_probs, na.rm = TRUE)
+
+  cv_predictive_performance <- data.frame(
+    species = species_names,
+    observed_prevalence = observed_prev[species_names],
+    cv_predicted_prevalence = cv_predicted_prev[species_names],
+    cv_auc = NA_real_,
+    cv_rmse = NA_real_,
+    cv_tjur_r2 = NA_real_,
+    stringsAsFactors = FALSE
+  )
+
+  for (sp in species_names) {
+    obs <- Y[, sp]
+    score <- cv_pred_probs[, sp]
+
+    cv_predictive_performance$cv_auc[cv_predictive_performance$species == sp] <- simple_auc(obs, score)
+    cv_predictive_performance$cv_rmse[cv_predictive_performance$species == sp] <-
+      sqrt(mean((obs - score)^2, na.rm = TRUE))
+    cv_predictive_performance$cv_tjur_r2[cv_predictive_performance$species == sp] <-
+      mean(score[obs == 1], na.rm = TRUE) - mean(score[obs == 0], na.rm = TRUE)
+  }
+
+  write.csv(
+    cv_predictive_performance,
+    out_path("hmsc_cv_species_predictive_performance.csv"),
+    row.names = FALSE
+  )
+
+  insample_vs_cv <- merge(
+    predictive_performance,
+    cv_predictive_performance,
+    by = "species",
+    all = TRUE
+  )
+  write.csv(insample_vs_cv, out_path("hmsc_insample_vs_cv_performance.csv"), row.names = FALSE)
+
+  cv_summary <- data.frame(
+    n_folds = n_folds,
+    mean_cv_auc = mean(cv_predictive_performance$cv_auc, na.rm = TRUE),
+    median_cv_auc = median(cv_predictive_performance$cv_auc, na.rm = TRUE),
+    mean_in_sample_auc = mean(predictive_performance$auc, na.rm = TRUE),
+    median_in_sample_auc = median(predictive_performance$auc, na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+  write.csv(cv_summary, out_path("hmsc_cv_summary.csv"), row.names = FALSE)
+
+  # Figure 4: observed prevalence against cross-validated predicted prevalence.
+  png(out_path("fig_04_hmsc_cv_observed_vs_predicted_prevalence.png"), width = 1300, height = 1100, res = 160)
+  old_par <- par(no.readonly = TRUE)
+  par(mar = c(5, 5, 4, 2))
+
+  plot(
+    cv_predictive_performance$observed_prevalence,
+    cv_predictive_performance$cv_predicted_prevalence,
+    pch = 19,
+    col = "#2C7FB8",
+    xlab = "Observed prevalence",
+    ylab = "Cross-validated predicted prevalence",
+    xlim = c(0, 1),
+    ylim = c(0, 1)
+  )
+  grid(col = "grey85", lty = "dotted")
+  abline(0, 1, lty = 2, col = "grey50")
+
+  legend(
+    "topleft",
+    legend = c(
+      "5-fold CV",
+      paste0("Median AUC = ", format(round(cv_summary$median_cv_auc, 3), nsmall = 3)),
+      paste0("Mean AUC = ", format(round(cv_summary$mean_cv_auc, 3), nsmall = 3))
+    ),
+    bty = "o",
+    bg = "white",
+    cex = 0.85
+  )
+
+  label_pos <- data.frame(
+    species = c("sp10", "sp3", "sp6", "sp11", "sp22", "sp7", "sp8", "sp9",
+                "sp19", "sp18", "sp20", "sp12", "sp17", "sp4", "sp15",
+                "sp5", "sp1", "sp21", "sp14", "sp16", "sp13", "sp2"),
+    label_x = c(0.035, 0.035, 0.035, 0.035, 0.035, 0.205, 0.205, 0.205,
+                0.285, 0.315, 0.360, 0.365, 0.400, 0.525, 0.590,
+                0.610, 0.705, 0.710, 0.755, 0.790, 0.875, 0.305),
+    label_y = c(0.160, 0.132, 0.106, 0.080, 0.055, 0.198, 0.145, 0.105,
+                0.272, 0.292, 0.314, 0.342, 0.392, 0.515, 0.575,
+                0.570, 0.675, 0.695, 0.705, 0.748, 0.835, 0.282),
+    stringsAsFactors = FALSE
+  )
+
+  for (i in seq_len(nrow(cv_predictive_performance))) {
+    sp <- cv_predictive_performance$species[i]
+    px <- cv_predictive_performance$observed_prevalence[i]
+    py <- cv_predictive_performance$cv_predicted_prevalence[i]
+
+    label_row <- label_pos[label_pos$species == sp, , drop = FALSE]
+    if (nrow(label_row) == 1) {
+      tx <- label_row$label_x
+      ty <- label_row$label_y
+    } else {
+      tx <- min(px + 0.025, 0.97)
+      ty <- min(py + 0.015, 0.97)
+    }
+
+    if (sqrt((tx - px)^2 + (ty - py)^2) > 0.035) {
+      segments(px, py, tx, ty, col = "grey45", lwd = 0.7)
+    }
+
+    text(tx, ty, labels = sp, cex = 0.75, pos = ifelse(tx < px, 2, 4))
+  }
+
+  par(old_par)
+  dev.off()
+
+  # Figure 5: in-sample AUC against cross-validated AUC.
+  png(out_path("fig_05_hmsc_insample_vs_cv_auc.png"), width = 1400, height = 1100, res = 160)
+  old_par <- par(no.readonly = TRUE)
+  par(mar = c(5, 5, 4, 2))
+
+  plot(
+    insample_vs_cv$auc,
+    insample_vs_cv$cv_auc,
+    pch = 19,
+    col = "#4C78A8",
+    xlab = "In-sample AUC",
+    ylab = "Cross-validated AUC",
+    xlim = c(0, 1),
+    ylim = c(0, 1),
+    main = "In-sample vs cross-validated AUC"
+  )
+  abline(0, 1, lty = 2, col = "grey55")
+  abline(h = 0.5, lty = 3, col = "grey50")
+  abline(v = 0.5, lty = 3, col = "grey50")
+
+  text(
+    insample_vs_cv$auc,
+    insample_vs_cv$cv_auc,
+    labels = insample_vs_cv$species,
+    pos = 4,
+    cex = 0.75
+  )
+
+  par(old_par)
+  dev.off()
+
+  # 9. Extract residual species associations
+
+  association_attempt <- try(computeAssociations(selected_model), silent = TRUE)
+
+  if (!inherits(association_attempt, "try-error") &&
+      length(association_attempt) > 0 &&
+      !is.null(association_attempt[[1]]$mean)) {
+    association_matrix <- association_attempt[[1]]$mean
+    association_source <- "Hmsc computeAssociations"
+  } else {
+    residual_matrix <- Y - pred_probs
+    association_matrix <- cor(residual_matrix, use = "pairwise.complete.obs")
+    association_source <- "correlation of observed minus predicted residuals"
+  }
+
+  association_matrix <- as.matrix(association_matrix)
+  rownames(association_matrix) <- species_names
+  colnames(association_matrix) <- species_names
+
+  write.csv(association_matrix, out_path("hmsc_species_association_matrix.csv"), row.names = TRUE)
+
+  make_heatmap(
+    association_matrix,
+    "fig_06_hmsc_species_association_heatmap.png",
+    "Hmsc residual species association matrix",
+    zlim = c(-1, 1),
+    value_labels = FALSE,
+    legend_title = "Association"
+  )
+
+  assoc_values <- if (nrow(association_matrix) >= 2) {
+    association_matrix[upper.tri(association_matrix)]
+  } else {
+    numeric(0)
+  }
+
+  association_summary <- data.frame(
+    association_source = association_source,
+    median_absolute_association = ifelse(length(assoc_values) == 0, NA_real_, median(abs(assoc_values), na.rm = TRUE)),
+    maximum_absolute_association = ifelse(length(assoc_values) == 0, NA_real_, max(abs(assoc_values), na.rm = TRUE)),
+    strength_label = association_strength_label(assoc_values),
+    stringsAsFactors = FALSE
+  )
+
+  write.csv(association_summary, out_path("hmsc_species_association_summary.csv"), row.names = FALSE)
+
+  # 10. Check MCMC diagnostics
+
+  coda_attempt <- try(convertToCodaObject(selected_model), silent = TRUE)
+
+  diagnostics_ok <- FALSE
+  diagnostics_available <- FALSE
+
+  diagnostics_summary <- data.frame(
+    selected_model = selected_model_name,
+    selected_model_file = selected_model_file,
+    beta_parameter_count = NA_integer_,
+    min_effective_sample_size = NA_real_,
+    median_effective_sample_size = NA_real_,
+    max_rhat_point_estimate = NA_real_,
+    median_rhat_point_estimate = NA_real_,
+    max_rhat_upper_ci = NA_real_,
+    diagnostics_ok = FALSE,
+    stringsAsFactors = FALSE
+  )
+
+  if (!inherits(coda_attempt, "try-error") &&
+      "Beta" %in% names(coda_attempt) &&
+      requireNamespace("coda", quietly = TRUE)) {
+    beta_coda <- coda_attempt$Beta
+    ess <- coda::effectiveSize(beta_coda)
+    gelman_attempt <- try(coda::gelman.diag(beta_coda, multivariate = FALSE), silent = TRUE)
+
+    if (!inherits(gelman_attempt, "try-error")) {
+      rhat <- gelman_attempt$psrf[, "Point est."]
+      rhat_upper <- gelman_attempt$psrf[, "Upper C.I."]
+
+      diagnostics_available <- TRUE
+
+      diagnostics_ok <- max(rhat, na.rm = TRUE) <= 1.10 &&
+        median(rhat, na.rm = TRUE) <= 1.05 &&
+        min(ess, na.rm = TRUE) >= 100
+
+      diagnostics_table <- data.frame(
+        parameter = names(ess),
+        effective_sample_size = as.numeric(ess),
+        rhat_point_estimate = as.numeric(rhat[names(ess)]),
+        rhat_upper_ci = as.numeric(rhat_upper[names(ess)]),
+        stringsAsFactors = FALSE
+      )
+
+      write.csv(diagnostics_table, out_path("hmsc_beta_diagnostics_table.csv"), row.names = FALSE)
+
+      diagnostics_summary <- data.frame(
+        selected_model = selected_model_name,
+        selected_model_file = selected_model_file,
+        beta_parameter_count = length(ess),
+        min_effective_sample_size = min(ess, na.rm = TRUE),
+        median_effective_sample_size = median(ess, na.rm = TRUE),
+        max_rhat_point_estimate = max(rhat, na.rm = TRUE),
+        median_rhat_point_estimate = median(rhat, na.rm = TRUE),
+        max_rhat_upper_ci = max(rhat_upper, na.rm = TRUE),
+        diagnostics_ok = diagnostics_ok,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  if (!diagnostics_available) {
+    diagnostics_table <- data.frame(
+      parameter = character(),
+      effective_sample_size = numeric(),
+      rhat_point_estimate = numeric(),
+      rhat_upper_ci = numeric(),
+      stringsAsFactors = FALSE
+    )
+    write.csv(diagnostics_table, out_path("hmsc_beta_diagnostics_table.csv"), row.names = FALSE)
+  }
+
+  write.csv(diagnostics_summary, out_path("hmsc_diagnostics_summary.csv"), row.names = FALSE)
+
+  # 11. Save a compact list of created output files
+
+  output_files <- sort(list.files(output_dir, recursive = TRUE, full.names = TRUE))
+  output_files <- unique(c(output_files, out_path("created_files.csv")))
+
+  created_files_table <- data.frame(
+    file_path = output_files,
+    file_name = basename(output_files),
+    stringsAsFactors = FALSE
+  )
+
+  write.csv(created_files_table, out_path("created_files.csv"), row.names = FALSE)
+}
+
+tryCatch(
+  {
+    main()
+    message("Hmsc JSDM analysis completed successfully.")
+  },
+  error = function(e) {
+    project_dir <- "D:/Beetles"
+    output_dir <- file.path(project_dir, "Hmsc_JSDM_outputs")
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+    log_file <- file.path(output_dir, "hmsc_error_log.txt")
+
+    writeLines(
+      c(
+        "Hmsc JSDM analysis failed.",
+        paste("Time:", as.character(Sys.time())),
+        paste("Error:", conditionMessage(e)),
+        "",
+        "Traceback:",
+        paste(capture.output(traceback()), collapse = "\n")
+      ),
+      con = log_file,
+      useBytes = TRUE
+    )
+
+    message("Hmsc JSDM analysis failed. See hmsc_error_log.txt in the output folder.")
+    stop("Analysis stopped because an error occurred. Check hmsc_error_log.txt for details.")
+  }
+)
